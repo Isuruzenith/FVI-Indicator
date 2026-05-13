@@ -1,0 +1,410 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  ORDER FLOW TRADER PRO  —  All Timeframe Edition
+//  Pine Script v5  |  Version 1.0
+//
+//  CONCEPTS (fully independent implementation):
+//
+//  1. LIQUIDITY POOLS
+//     Previous HTF high/low drawn as dotted reference lines.
+//     HTF is auto-scaled relative to the current chart timeframe so the
+//     reference is always one meaningful level above (e.g. on a 5m chart
+//     the reference is the 1H high/low; on a 1H chart it is the Daily).
+//     User can override the auto-selection.
+//
+//  2. LIQUIDITY SWEEP
+//     A sweep is a wick-rejection event:
+//       - Wick pierces the HTF level (or comes within proximity %)
+//       - Candle BODY closes back on the protected side
+//       - Rejection wick >= minWick % of total candle range
+//       - Per-level cooldown prevents clustering
+//
+//  3. CHANGE OF CHARACTER (ChoCh)
+//     After a sweep arms the system, a ChoCh fires when price body-closes
+//     past the most recent swing high (bullish ChoCh) or swing low (bearish
+//     ChoCh).  The arm expires after a configurable window so stale sweeps
+//     cannot trigger delayed ChoCh signals.
+//
+//  4. BREAK OF STRUCTURE (BOS)
+//     Structural continuation break detected when NO sweep is pending.
+//     Confirms trend direction without reversal context.
+//
+//  5. FAIR VALUE GAP (FVG)
+//     3-candle imbalance detected within a post-ChoCh window.
+//     Boxes are extended until price mitigates them (re-entry zone).
+//     Minimum gap size filter prevents micro-gap noise.
+//
+//  6. VOLUME DELTA MOMENTUM
+//     Money Flow Multiplier method estimates buying vs selling pressure.
+//     EMA-smoothed delta vs a signal line produces directional bias.
+//     Used as a CONFLUENCE GATE on all entry signals.
+//
+//  7. CONFLUENCE ENTRY ENGINE
+//     LONG  : Bullish ChoCh  confirmed  +  delta bias bullish
+//     SHORT : Bearish ChoCh confirmed   +  delta bias bearish
+//     RE-LONG  : FVG tap (post-ChoCh)   +  delta still bullish
+//     RE-SHORT : FVG tap (post-ChoCh)   +  delta still bearish
+//     Delta gate is toggleable.
+//
+//  TIMEFRAME ADAPTIVE DEFAULTS:
+//     Swing lookback and HTF reference scale automatically.
+//     All cooldowns expressed in bars (timeframe-agnostic).
+// ════════════════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator(title = "Order Flow Trader Pro", shorttitle = "OFT Pro", overlay = true, max_lines_count = 300, max_labels_count = 300, max_boxes_count = 200)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 1 — INPUTS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Liquidity Levels ─────────────────────────────────────────────────────
+i_autoHTF      = input.bool(true,   "Auto HTF Reference",     group = "Liquidity Levels", tooltip = "Automatically selects the HTF based on current chart timeframe. Turn off to set manually.")
+i_liqTF        = input.timeframe("D", "Manual HTF (if Auto OFF)", group = "Liquidity Levels")
+i_proximityPct = input.float(0.1,   "Proximity % to Level",   group = "Liquidity Levels", minval = 0.01, maxval = 2.0, step = 0.01, tooltip = "Wick must reach within this % of the HTF level to qualify as a sweep attempt.")
+i_showLiqLines = input.bool(true,   "Show HTF Lines",          group = "Liquidity Levels")
+i_showLiqLbls  = input.bool(true,   "Show HTF Labels",         group = "Liquidity Levels")
+i_liqCol       = input.color(color.new(#f5c518, 10), "Level Color", group = "Liquidity Levels")
+
+// ── Sweep Detection ───────────────────────────────────────────────────────
+i_wickPct      = input.float(30.0,  "Min Rejection Wick %",   group = "Sweep Detection",  minval = 5.0,  maxval = 80.0, step = 1.0, tooltip = "Rejection wick / total candle range must exceed this. 30% = meaningful rejection.")
+i_sweepCD      = input.int(5,       "Sweep Cooldown (bars)",  group = "Sweep Detection",  minval = 1, maxval = 100, tooltip = "Minimum bars before the same level can trigger another sweep signal.")
+i_showSweep    = input.bool(true,   "Show Sweep Labels",      group = "Sweep Detection")
+i_sweepBullC   = input.color(color.new(#00bcd4, 0), "Bull Sweep Color", group = "Sweep Detection")
+i_sweepBearC   = input.color(color.new(#ff6f00, 0), "Bear Sweep Color", group = "Sweep Detection")
+
+// ── Market Structure ──────────────────────────────────────────────────────
+i_swingLen     = input.int(8,       "Swing Lookback",         group = "Market Structure", minval = 2, maxval = 50, tooltip = "Bars on each side for pivot detection. Larger = fewer, more significant swings.")
+i_chochWin     = input.int(12,      "ChoCh Window (bars)",    group = "Market Structure", minval = 3, maxval = 100, tooltip = "Max bars after a sweep during which a ChoCh can fire. Keeps signals fresh.")
+i_showChoch    = input.bool(true,   "Show ChoCh",             group = "Market Structure")
+i_showBos      = input.bool(true,   "Show BOS",               group = "Market Structure")
+i_chochCol     = input.color(color.new(#e040fb, 0), "ChoCh Color", group = "Market Structure")
+i_bosCol       = input.color(color.new(#69f0ae, 0), "BOS Color",   group = "Market Structure")
+
+// ── Fair Value Gaps ───────────────────────────────────────────────────────
+i_showFVG      = input.bool(true,   "Show FVG Boxes",         group = "Fair Value Gaps")
+i_fvgMinPct    = input.float(0.05,  "Min Gap Size % of Price",group = "Fair Value Gaps",  minval = 0.01, maxval = 2.0, step = 0.01, tooltip = "FVG must be at least this % of close price. Filters tiny imbalances.")
+i_fvgExtend    = input.int(50,      "Extend Boxes (bars)",    group = "Fair Value Gaps",  minval = 5, maxval = 500)
+i_fvgBullC     = input.color(color.new(#00e676, 85), "Bull FVG Fill",  group = "Fair Value Gaps")
+i_fvgBearC     = input.color(color.new(#ff1744, 85), "Bear FVG Fill",  group = "Fair Value Gaps")
+i_fvgBorderC   = input.color(color.new(#607d8b, 60), "Border Color",   group = "Fair Value Gaps")
+
+// ── Volume Delta ──────────────────────────────────────────────────────────
+i_deltaLen     = input.int(14,      "Delta Smoothing",        group = "Volume Delta", minval = 1, maxval = 100)
+i_sigLen       = input.int(9,       "Signal Line",            group = "Volume Delta", minval = 1, maxval = 100)
+i_showDeltaMk  = input.bool(true,   "Show Delta Cross Marks", group = "Volume Delta", tooltip = "Small dots on the chart where delta crosses its signal line.")
+
+// ── Entry Signals ─────────────────────────────────────────────────────────
+i_requireDelta = input.bool(true,   "Require Delta Confluence", group = "Entry Signals", tooltip = "BUY/SELL only prints when ChoCh AND delta bias agree. Recommended ON.")
+i_showEntry    = input.bool(true,   "Show Entry Labels",        group = "Entry Signals")
+i_entryBullC   = input.color(color.new(#76ff03, 0), "BUY Color",  group = "Entry Signals")
+i_entrySellC   = input.color(color.new(#ff1744, 0), "SELL Color", group = "Entry Signals")
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 2 — AUTO HTF SELECTION
+//  Maps current TF to a sensible reference TF one step above.
+//  Intraday scalpers get hourly levels; swing traders get weekly levels.
+// ════════════════════════════════════════════════════════════════════════════
+
+_autoHTF() =>
+    int tfMin = timeframe.in_seconds() / 60
+    string r = "M"
+    if tfMin <= 5
+        r := "60"
+    else if tfMin <= 15
+        r := "240"
+    else if tfMin <= 60
+        r := "D"
+    else if tfMin <= 240
+        r := "W"
+    r
+
+string resolvedTF = i_autoHTF ? _autoHTF() : i_liqTF
+string tfLabel = resolvedTF == "60" ? "1H" : resolvedTF == "240" ? "4H" : resolvedTF == "D" ? "D" : resolvedTF == "W" ? "W" : resolvedTF == "M" ? "M" : resolvedTF
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 3 — HTF LIQUIDITY LEVELS
+// ════════════════════════════════════════════════════════════════════════════
+
+htfHigh = request.security(syminfo.tickerid, resolvedTF, high[1], lookahead = barmerge.lookahead_on)
+htfLow  = request.security(syminfo.tickerid, resolvedTF, low[1],  lookahead = barmerge.lookahead_on)
+
+var line  llHighLine = na
+var line  llLowLine  = na
+var label llHighLbl  = na
+var label llLowLbl   = na
+
+if i_showLiqLines
+    line.delete(llHighLine)
+    line.delete(llLowLine)
+    llHighLine := line.new(bar_index, htfHigh, bar_index + 1, htfHigh, extend = extend.right, color = i_liqCol, style = line.style_dotted, width = 1)
+    llLowLine  := line.new(bar_index, htfLow,  bar_index + 1, htfLow,  extend = extend.right, color = i_liqCol, style = line.style_dotted, width = 1)
+
+if i_showLiqLbls
+    label.delete(llHighLbl)
+    label.delete(llLowLbl)
+    llHighLbl := label.new(bar_index + 2, htfHigh, text = tfLabel + "H", style = label.style_none, color = color.new(color.white, 100), textcolor = i_liqCol, size = size.small)
+    llLowLbl  := label.new(bar_index + 2, htfLow,  text = tfLabel + "L", style = label.style_none, color = color.new(color.white, 100), textcolor = i_liqCol, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 4 — VOLUME DELTA
+//  Money Flow Multiplier: estimates net buying vs selling per candle.
+//  Positive delta = buyers in control; negative = sellers.
+// ════════════════════════════════════════════════════════════════════════════
+
+float mfm         = (high == low) ? 0.0 : ((close - low) - (high - close)) / (high - low)
+float rawDelta    = mfm * volume
+float smDelta     = ta.ema(rawDelta, i_deltaLen)
+float sigDelta    = ta.ema(smDelta,  i_sigLen)
+
+bool  deltaBull   = smDelta > sigDelta           // broad bullish bias
+bool  deltaBear   = smDelta < sigDelta           // broad bearish bias
+bool  deltaCrossUp   = ta.crossover(smDelta,  sigDelta) and smDelta < 0
+bool  deltaCrossDown = ta.crossunder(smDelta, sigDelta) and smDelta > 0
+
+// Delta histogram in sub-pane (add indicator to new pane to view)
+color dCol = smDelta > 0
+     ? (smDelta > smDelta[1] ? color.new(#00e676, 10) : color.new(#00695c, 15))
+     : (smDelta < smDelta[1] ? color.new(#ff1744, 10) : color.new(#b71c1c, 15))
+
+plot(smDelta,   title = "Delta",       color = dCol, style = plot.style_columns, display = display.pane)
+plot(sigDelta,  title = "Delta Signal",color = color.new(#ffeb3b, 0), linewidth = 2, display = display.pane)
+hline(0, "Zero Line", color = color.new(#546e7a, 50), linestyle = hline.style_solid)
+
+// Tiny dot marks on price chart when delta crosses
+if i_showDeltaMk
+    if deltaCrossUp
+        label.new(bar_index, low,  text = "•", style = label.style_label_up,   color = color.new(#00bcd4, 40), textcolor = color.white, size = size.tiny)
+    if deltaCrossDown
+        label.new(bar_index, high, text = "•", style = label.style_label_down, color = color.new(#ff6f00, 40), textcolor = color.white, size = size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 5 — LIQUIDITY SWEEP DETECTION
+//
+//  Four simultaneous conditions:
+//    A) Wick reaches within proximityPct of the HTF level
+//    B) Candle BODY (not wick) closes back on the near side
+//    C) The rejection wick occupies >= wickPct% of total candle range
+//    D) Per-level cooldown has elapsed (separate counters for high/low)
+// ════════════════════════════════════════════════════════════════════════════
+
+float cRange    = high - low
+float bHigh     = math.max(open, close)
+float bLow      = math.min(open, close)
+float uWick     = high - bHigh
+float lWick     = bLow  - low
+float proxAbs   = math.abs(htfHigh - htfLow) == 0 ? htfHigh * 0.001 : htfHigh * (i_proximityPct / 100.0)
+float wickFr    = i_wickPct / 100.0
+
+var int lastBSBar = -999
+var int lastBrBar = -999
+
+bool cdBull = (bar_index - lastBSBar) >= i_sweepCD
+bool cdBear = (bar_index - lastBrBar) >= i_sweepCD
+
+// Bullish sweep: wick into PDL zone, body close above PDL
+bool bullSweep = cdBull and (low <= htfLow + proxAbs) and (close > htfLow) and (cRange > 0) and (lWick / cRange >= wickFr)
+// Bearish sweep: wick into PDH zone, body close below PDH
+bool bearSweep = cdBear and (high >= htfHigh - proxAbs) and (close < htfHigh) and (cRange > 0) and (uWick / cRange >= wickFr)
+
+if bullSweep
+    lastBSBar := bar_index
+if bearSweep
+    lastBrBar := bar_index
+
+if i_showSweep
+    if bullSweep
+        label.new(bar_index, low,  text = "Sweep", style = label.style_label_up,   color = i_sweepBullC, textcolor = color.black, size = size.small)
+    if bearSweep
+        label.new(bar_index, high, text = "Sweep", style = label.style_label_down, color = i_sweepBearC, textcolor = color.black, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 6 — SWING HIGH / LOW  (pivot-based)
+// ════════════════════════════════════════════════════════════════════════════
+
+float pivH = ta.pivothigh(high, i_swingLen, i_swingLen)
+float pivL = ta.pivotlow (low,  i_swingLen, i_swingLen)
+
+var float lastSH    = na
+var float lastSL    = na
+var int   lastSHBar = na
+var int   lastSLBar = na
+
+if not na(pivH)
+    lastSH    := pivH
+    lastSHBar := bar_index - i_swingLen
+
+if not na(pivL)
+    lastSL    := pivL
+    lastSLBar := bar_index - i_swingLen
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 7 — CHANGE OF CHARACTER (ChoCh) & BREAK OF STRUCTURE (BOS)
+//
+//  ChoCh state machine:
+//    IDLE       → sweep fires → ARMED (direction locked, window starts)
+//    ARMED      → body close past swing → FIRED (ChoCh drawn, arm released)
+//    ARMED      → window expires        → IDLE  (stale sweep discarded)
+//    FIRED/IDLE → body close past swing → BOS   (continuation, with cooldown)
+// ════════════════════════════════════════════════════════════════════════════
+
+var bool sArmed    = false
+var bool sIsBull   = false
+var int  sArmedAt  = -999
+var bool chFired   = false
+var int  bosLastBar = -999
+
+// Arm on sweep
+if bullSweep
+    sArmed   := true
+    sIsBull  := true
+    sArmedAt := bar_index
+    chFired  := false
+
+if bearSweep
+    sArmed   := true
+    sIsBull  := false
+    sArmedAt := bar_index
+    chFired  := false
+
+// Expire arm if window passed
+bool winOpen = sArmed and (bar_index - sArmedAt <= i_chochWin)
+if sArmed and not winOpen
+    sArmed := false
+
+// ChoCh fires
+bool chochBull = winOpen and sIsBull     and not chFired and not na(lastSH) and (close > lastSH)
+bool chochBear = winOpen and not sIsBull and not chFired and not na(lastSL) and (close < lastSL)
+
+if chochBull or chochBear
+    sArmed  := false
+    chFired := true
+
+// BOS fires (continuation, no active sweep arm)
+bool bosCD   = (bar_index - bosLastBar) >= i_chochWin
+bool bosBull = not sArmed and bosCD and not na(lastSH) and (close > lastSH)
+bool bosBear = not sArmed and bosCD and not na(lastSL) and (close < lastSL)
+
+if bosBull or bosBear
+    bosLastBar := bar_index
+
+if i_showChoch
+    if chochBull
+        line.new(lastSHBar, lastSH, bar_index, lastSH, color = i_chochCol, style = line.style_solid, width = 2)
+        label.new(bar_index, lastSH, text = "ChoCh", style = label.style_label_down, color = i_chochCol, textcolor = color.black, size = size.small)
+    if chochBear
+        line.new(lastSLBar, lastSL, bar_index, lastSL, color = i_chochCol, style = line.style_solid, width = 2)
+        label.new(bar_index, lastSL, text = "ChoCh", style = label.style_label_up, color = i_chochCol, textcolor = color.black, size = size.small)
+
+if i_showBos
+    if bosBull
+        line.new(lastSHBar, lastSH, bar_index, lastSH, color = i_bosCol, style = line.style_solid, width = 1)
+        label.new(bar_index, lastSH, text = "BOS", style = label.style_label_down, color = i_bosCol, textcolor = color.black, size = size.tiny)
+    if bosBear
+        line.new(lastSLBar, lastSL, bar_index, lastSL, color = i_bosCol, style = line.style_solid, width = 1)
+        label.new(bar_index, lastSL, text = "BOS", style = label.style_label_up, color = i_bosCol, textcolor = color.black, size = size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 8 — FAIR VALUE GAP (FVG)
+//
+//  Detected on 3-candle imbalance sequences in the impulse leg
+//  following a confirmed ChoCh.  Box extends until mitigation.
+//
+//  Bullish FVG : candle[-2] high  <  candle[0] low   (gap upward)
+//  Bearish FVG : candle[-2] low   >  candle[0] high  (gap downward)
+//  (Pine uses [2] and [0] because we evaluate on close of candle[0])
+// ════════════════════════════════════════════════════════════════════════════
+
+var int fvgChochBar = na
+if chochBull or chochBear
+    fvgChochBar := bar_index
+
+bool fvgWindow   = not na(fvgChochBar) and (bar_index - fvgChochBar <= 20)
+float minGap     = close * (i_fvgMinPct / 100.0)
+
+bool bFVG = fvgWindow and (high[2] < low[0])  and ((low[0]  - high[2]) >= minGap)
+bool sFVG = fvgWindow and (low[2]  > high[0]) and ((low[2]  - high[0]) >= minGap)
+
+var box[]   fvgB   = array.new_box()
+var float[] fvgTop = array.new_float()
+var float[] fvgBot = array.new_float()
+var bool[]  fvgDir = array.new_bool()   // true = bullish
+
+if i_showFVG
+    if bFVG
+        array.push(fvgB,   box.new(bar_index - 2, low[0],  bar_index + i_fvgExtend, high[2], border_color = i_fvgBorderC, bgcolor = i_fvgBullC))
+        array.push(fvgTop, low[0])
+        array.push(fvgBot, high[2])
+        array.push(fvgDir, true)
+    if sFVG
+        array.push(fvgB,   box.new(bar_index - 2, low[2],  bar_index + i_fvgExtend, high[0], border_color = i_fvgBorderC, bgcolor = i_fvgBearC))
+        array.push(fvgTop, low[2])
+        array.push(fvgBot, high[0])
+        array.push(fvgDir, false)
+
+var bool fvgTapped    = false
+var bool fvgTapIsBull = false
+fvgTapped := false
+
+if array.size(fvgB) > 0
+    int fi = array.size(fvgB) - 1
+    while fi >= 0
+        float ft  = array.get(fvgTop, fi)
+        float fb  = array.get(fvgBot, fi)
+        bool  fd  = array.get(fvgDir, fi)
+        box   fb2 = array.get(fvgB,   fi)
+        bool  hit = (close <= ft and close >= fb) or (low <= ft and low >= fb) or (high <= ft and high >= fb)
+        if hit
+            box.set_right(fb2, bar_index)
+            array.remove(fvgB,   fi)
+            array.remove(fvgTop, fi)
+            array.remove(fvgBot, fi)
+            array.remove(fvgDir, fi)
+            fvgTapped    := true
+            fvgTapIsBull := fd
+        else
+            box.set_right(fb2, bar_index + i_fvgExtend)
+        fi := fi - 1
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 9 — CONFLUENCE ENTRY ENGINE
+//
+//  Signal hierarchy:
+//    PRIMARY   → ChoCh + delta bias aligned          → BUY / SELL
+//    SECONDARY → FVG tap + delta bias still aligned  → RE-LONG / RE-SHORT
+//
+//  Delta gate (i_requireDelta):
+//    Uses broad bias (smDelta vs sigDelta) rather than crossover-only,
+//    so entries remain valid even when delta doesn't cross at that exact bar.
+// ════════════════════════════════════════════════════════════════════════════
+
+bool entryLong    = chochBull and (i_requireDelta ? deltaBull : true)
+bool entryShort   = chochBear and (i_requireDelta ? deltaBear : true)
+bool reLong       = fvgTapped and fvgTapIsBull  and deltaBull  and not entryLong
+bool reShort      = fvgTapped and not fvgTapIsBull and deltaBear and not entryShort
+
+if i_showEntry
+    if entryLong
+        label.new(bar_index, low,  text = "BUY",      style = label.style_label_up,   color = i_entryBullC, textcolor = color.black, size = size.normal)
+    if entryShort
+        label.new(bar_index, high, text = "SELL",     style = label.style_label_down, color = i_entrySellC, textcolor = color.white, size = size.normal)
+    if reLong
+        label.new(bar_index, low,  text = "RE-LONG",  style = label.style_label_up,   color = color.new(#00acc1, 15), textcolor = color.white, size = size.small)
+    if reShort
+        label.new(bar_index, high, text = "RE-SHORT", style = label.style_label_down, color = color.new(#c62828, 15), textcolor = color.white, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECTION 10 — ALERT CONDITIONS
+// ════════════════════════════════════════════════════════════════════════════
+
+alertcondition(bullSweep,            title = "Sweep — Bullish",      message = "OFT Pro | Bullish Sweep on {{ticker}} {{interval}}. Watching for ChoCh.")
+alertcondition(bearSweep,            title = "Sweep — Bearish",      message = "OFT Pro | Bearish Sweep on {{ticker}} {{interval}}. Watching for ChoCh.")
+alertcondition(chochBull,            title = "ChoCh — Bull",         message = "OFT Pro | Bullish ChoCh confirmed on {{ticker}} {{interval}}.")
+alertcondition(chochBear,            title = "ChoCh — Bear",         message = "OFT Pro | Bearish ChoCh confirmed on {{ticker}} {{interval}}.")
+alertcondition(bosBull,              title = "BOS — Bull",           message = "OFT Pro | Bullish BOS on {{ticker}} {{interval}}. Trend continuation.")
+alertcondition(bosBear,              title = "BOS — Bear",           message = "OFT Pro | Bearish BOS on {{ticker}} {{interval}}. Trend continuation.")
+alertcondition(entryLong,            title = "ENTRY — Long",         message = "OFT Pro | BUY signal on {{ticker}} {{interval}}. ChoCh + Delta aligned.")
+alertcondition(entryShort,           title = "ENTRY — Short",        message = "OFT Pro | SELL signal on {{ticker}} {{interval}}. ChoCh + Delta aligned.")
+alertcondition(reLong,               title = "RE-ENTRY — Long",      message = "OFT Pro | RE-LONG on {{ticker}} {{interval}}. FVG tap + Delta bullish.")
+alertcondition(reShort,              title = "RE-ENTRY — Short",     message = "OFT Pro | RE-SHORT on {{ticker}} {{interval}}. FVG tap + Delta bearish.")
+alertcondition(fvgTapped,            title = "FVG Mitigated",        message = "OFT Pro | FVG tapped on {{ticker}} {{interval}}.")
+alertcondition(entryLong or entryShort or reLong or reShort, title = "Any Entry", message = "OFT Pro | Entry signal on {{ticker}} {{interval}}. Check chart.")

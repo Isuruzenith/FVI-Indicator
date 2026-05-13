@@ -1,0 +1,328 @@
+// ════════════════════════════════════════════════════════════════
+//  LS-OFT + VOLUME DELTA MOMENTUM  —  30-Minute Edition  v1.0
+//  Pine Script v5
+//
+//  Architecture:
+//    overlay = true  →  all LS-OFT drawings on the price chart
+//    Delta histogram rendered in a dedicated sub-pane via plot()
+//      (add the indicator twice: once to chart, once to new pane,
+//       or use the built-in pane selector in TradingView settings)
+//
+//  Confluence logic:
+//    LONG  entry = Bullish Sweep + ChoCh Bull + Delta crosses UP
+//    SHORT entry = Bearish Sweep + ChoCh Bear + Delta crosses DOWN
+//    FVG tap alone triggers an alert only if delta agrees with bias
+//
+//  30m enforcement:
+//    Indicator warns and suppresses signals on any other timeframe.
+// ════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator(title = "LS-OFT + Delta [30m]", shorttitle = "LS-OFT·D 30m", overlay = true, max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200)
+
+// ──────────────────────────────────────────────
+//  30-MINUTE TIMEFRAME GUARD
+// ──────────────────────────────────────────────
+bool is30m = timeframe.period == "30"
+if not is30m and barstate.islast
+    label.new(bar_index, high, text = "⚠  LS-OFT·D requires 30m chart", style = label.style_label_left, color = color.new(color.red, 10), textcolor = color.white, size = size.normal)
+
+bgcolor(not is30m ? color.new(color.red, 90) : na, title = "Wrong TF Warning")
+
+// ──────────────────────────────────────────────
+//  INPUTS  —  Liquidity Levels
+// ──────────────────────────────────────────────
+i_liqTF         = input.timeframe("D", "HTF Reference", group = "Liquidity Levels", tooltip = "Higher timeframe level source. Default Daily for 30m chart.")
+i_proximityPct  = input.float(0.08, "Proximity % to Level", minval = 0.01, maxval = 1.0, step = 0.01, group = "Liquidity Levels", tooltip = "Wick must come within this % of the HTF level.")
+i_showLiqLines  = input.bool(true, "Show Level Lines",   group = "Liquidity Levels")
+i_showLiqLabels = input.bool(true, "Show Level Labels",  group = "Liquidity Levels")
+i_liqColor      = input.color(color.new(color.yellow, 15), "Level Color", group = "Liquidity Levels")
+
+// ──────────────────────────────────────────────
+//  INPUTS  —  Sweep
+// ──────────────────────────────────────────────
+i_wickPct       = input.float(32.0, "Min Rejection Wick %", minval = 10.0, maxval = 80.0, step = 1.0, group = "Sweep Detection", tooltip = "Wick must be this % of full candle range.")
+i_sweepCooldown = input.int(6, "Sweep Cooldown (bars)", minval = 1, maxval = 50, group = "Sweep Detection")
+i_showSweep     = input.bool(true, "Show Sweep Labels", group = "Sweep Detection")
+i_sweepBullC    = input.color(color.new(color.aqua,   0), "Bull Sweep Color", group = "Sweep Detection")
+i_sweepBearC    = input.color(color.new(color.orange, 0), "Bear Sweep Color", group = "Sweep Detection")
+
+// ──────────────────────────────────────────────
+//  INPUTS  —  Structure
+// ──────────────────────────────────────────────
+i_swingLen    = input.int(8, "Swing Lookback", minval = 3, maxval = 30, group = "Order Flow / Structure")
+i_chochWindow = input.int(12, "ChoCh Window (bars after sweep)", minval = 3, maxval = 50, group = "Order Flow / Structure")
+i_showChoch   = input.bool(true, "Show ChoCh", group = "Order Flow / Structure")
+i_showBos     = input.bool(true, "Show BOS",   group = "Order Flow / Structure")
+i_chochColor  = input.color(color.new(color.fuchsia, 0), "ChoCh Color", group = "Order Flow / Structure")
+i_bosColor    = input.color(color.new(color.lime,    0), "BOS Color",   group = "Order Flow / Structure")
+
+// ──────────────────────────────────────────────
+//  INPUTS  —  FVG
+// ──────────────────────────────────────────────
+i_showFVG    = input.bool(true, "Show FVG Boxes",  group = "Fair Value Gaps")
+i_fvgMinSize = input.float(0.06, "Min FVG Size % of Price", minval = 0.01, maxval = 1.0, step = 0.01, group = "Fair Value Gaps")
+i_fvgExtend  = input.int(40, "Extend Boxes (bars)", minval = 1, maxval = 500, group = "Fair Value Gaps")
+i_fvgBullC   = input.color(color.new(color.green, 82), "Bull FVG Fill", group = "Fair Value Gaps")
+i_fvgBearC   = input.color(color.new(color.red,   82), "Bear FVG Fill", group = "Fair Value Gaps")
+i_fvgBorderC = input.color(color.new(color.gray,  55), "FVG Border",    group = "Fair Value Gaps")
+
+// ──────────────────────────────────────────────
+//  INPUTS  —  Volume Delta
+// ──────────────────────────────────────────────
+i_deltaLen    = input.int(14, "Delta EMA Length",    minval = 1, group = "Volume Delta")
+i_sigLen      = input.int(9,  "Signal EMA Length",   minval = 1, group = "Volume Delta")
+i_showDeltaLbl = input.bool(true, "Show Delta Signal Labels", group = "Volume Delta")
+
+// ──────────────────────────────────────────────
+//  INPUTS  —  Confluence Entry
+// ──────────────────────────────────────────────
+i_requireDelta  = input.bool(true, "Require Delta Confluence for Entry", group = "Confluence Entry", tooltip = "When ON, a BUY/SELL label only prints if both ChoCh AND delta agree.")
+i_showEntry     = input.bool(true, "Show BUY / SELL Entry Labels", group = "Confluence Entry")
+i_entryBullC    = input.color(color.new(color.lime,  0), "BUY Label Color",  group = "Confluence Entry")
+i_entrySellC    = input.color(color.new(color.red,   0), "SELL Label Color", group = "Confluence Entry")
+
+// ──────────────────────────────────────────────
+//  HTF LIQUIDITY LEVELS
+// ──────────────────────────────────────────────
+htfHigh = request.security(syminfo.tickerid, i_liqTF, high[1], lookahead = barmerge.lookahead_on)
+htfLow  = request.security(syminfo.tickerid, i_liqTF, low[1],  lookahead = barmerge.lookahead_on)
+
+string liqPrefix = i_liqTF == "D" ? "PD" : i_liqTF == "W" ? "PW" : i_liqTF == "M" ? "PM" : "P"
+
+var line  liqHighLine = na
+var line  liqLowLine  = na
+var label liqHighLbl  = na
+var label liqLowLbl   = na
+
+if is30m and i_showLiqLines
+    line.delete(liqHighLine)
+    line.delete(liqLowLine)
+    liqHighLine := line.new(bar_index, htfHigh, bar_index + 1, htfHigh, extend = extend.right, color = i_liqColor, style = line.style_dotted, width = 1)
+    liqLowLine  := line.new(bar_index, htfLow,  bar_index + 1, htfLow,  extend = extend.right, color = i_liqColor, style = line.style_dotted, width = 1)
+
+if is30m and i_showLiqLabels
+    label.delete(liqHighLbl)
+    label.delete(liqLowLbl)
+    liqHighLbl := label.new(bar_index + 2, htfHigh, text = liqPrefix + "H", style = label.style_none, color = color.new(color.white, 100), textcolor = i_liqColor, size = size.small)
+    liqLowLbl  := label.new(bar_index + 2, htfLow,  text = liqPrefix + "L", style = label.style_none, color = color.new(color.white, 100), textcolor = i_liqColor, size = size.small)
+
+// ──────────────────────────────────────────────
+//  VOLUME DELTA (Money Flow Multiplier method)
+// ──────────────────────────────────────────────
+float mfm   = (high == low) ? 0.0 : ((close - low) - (high - close)) / (high - low)
+float delta = mfm * volume
+
+float smoothedDelta = ta.ema(delta, i_deltaLen)
+float signalLine    = ta.ema(smoothedDelta, i_sigLen)
+
+// Crossover signals
+bool deltaLong  = ta.crossover(smoothedDelta, signalLine)  and smoothedDelta < 0
+bool deltaShort = ta.crossunder(smoothedDelta, signalLine) and smoothedDelta > 0
+
+// Delta directional bias (for confluence gating)
+bool deltaBullish = smoothedDelta > signalLine
+bool deltaBearish = smoothedDelta < signalLine
+
+// Histogram colours — bright when accelerating, dark when decelerating
+color deltaCol = smoothedDelta > 0
+     ? (smoothedDelta > smoothedDelta[1] ? color.new(#00e676, 15) : color.new(#00695c, 20))
+     : (smoothedDelta < smoothedDelta[1] ? color.new(#ff1744, 15) : color.new(#b71c1c, 20))
+
+// ── Delta sub-pane plots (visible when indicator is added to new pane) ──
+plot(smoothedDelta, title = "Volume Delta", color = deltaCol, style = plot.style_columns, display = display.pane)
+plot(signalLine,    title = "Signal Line",  color = color.new(color.yellow, 0), linewidth = 2, display = display.pane)
+hline(0, "Zero", color = color.new(color.gray, 40), linestyle = hline.style_solid)
+
+// Optional delta crossover shapes on the price chart
+if i_showDeltaLbl
+    if deltaLong
+        label.new(bar_index, low  * 0.9998, text = "d", style = label.style_label_up,   color = color.new(color.teal, 40), textcolor = color.white, size = size.tiny)
+    if deltaShort
+        label.new(bar_index, high * 1.0002, text = "d", style = label.style_label_down, color = color.new(color.maroon, 40), textcolor = color.white, size = size.tiny)
+
+// ──────────────────────────────────────────────
+//  SWEEP DETECTION
+// ──────────────────────────────────────────────
+float candleRange  = high - low
+float bodyHigh     = math.max(open, close)
+float bodyLow      = math.min(open, close)
+float upperWick    = high - bodyHigh
+float lowerWick    = bodyLow - low
+float proximityAbs = htfHigh * (i_proximityPct / 100.0)
+float wickPctFr    = i_wickPct / 100.0
+
+var int lastBullSweepBar = -999
+var int lastBearSweepBar = -999
+
+bool cooldownOkBull = (bar_index - lastBullSweepBar) >= i_sweepCooldown
+bool cooldownOkBear = (bar_index - lastBearSweepBar) >= i_sweepCooldown
+
+bool bullSweep = is30m and cooldownOkBull and (low  <= htfLow  + proximityAbs) and (close > htfLow)  and (candleRange > 0) and ((lowerWick / candleRange) >= wickPctFr)
+bool bearSweep = is30m and cooldownOkBear and (high >= htfHigh - proximityAbs) and (close < htfHigh) and (candleRange > 0) and ((upperWick / candleRange) >= wickPctFr)
+
+if bullSweep
+    lastBullSweepBar := bar_index
+if bearSweep
+    lastBearSweepBar := bar_index
+
+if i_showSweep
+    if bullSweep
+        label.new(bar_index, low,  text = "Sweep", style = label.style_label_up,   color = i_sweepBullC, textcolor = color.black, size = size.small)
+    if bearSweep
+        label.new(bar_index, high, text = "Sweep", style = label.style_label_down, color = i_sweepBearC, textcolor = color.black, size = size.small)
+
+// ──────────────────────────────────────────────
+//  SWING HIGH / LOW
+// ──────────────────────────────────────────────
+float swingHigh = ta.pivothigh(high, i_swingLen, i_swingLen)
+float swingLow  = ta.pivotlow (low,  i_swingLen, i_swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var int   lastSHBar     = na
+var int   lastSLBar     = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+    lastSHBar     := bar_index - i_swingLen
+
+if not na(swingLow)
+    lastSwingLow := swingLow
+    lastSLBar    := bar_index - i_swingLen
+
+// ──────────────────────────────────────────────
+//  ChoCh / BOS
+// ──────────────────────────────────────────────
+var bool sweepArmed   = false
+var bool sweepIsBull  = false
+var int  sweepFiredAt = -999
+var bool chochFired   = false
+var int  lastBosBar   = -999
+
+if bullSweep
+    sweepArmed   := true
+    sweepIsBull  := true
+    sweepFiredAt := bar_index
+    chochFired   := false
+
+if bearSweep
+    sweepArmed   := true
+    sweepIsBull  := false
+    sweepFiredAt := bar_index
+    chochFired   := false
+
+bool sweepWindowOpen = sweepArmed and ((bar_index - sweepFiredAt) <= i_chochWindow)
+if sweepArmed and not sweepWindowOpen
+    sweepArmed := false
+
+bool chochBull = sweepWindowOpen and sweepIsBull     and not chochFired and not na(lastSwingHigh) and (close > lastSwingHigh)
+bool chochBear = sweepWindowOpen and not sweepIsBull and not chochFired and not na(lastSwingLow)  and (close < lastSwingLow)
+
+if chochBull or chochBear
+    sweepArmed := false
+    chochFired := true
+
+bool bosWindowOk = (bar_index - lastBosBar) >= i_chochWindow
+bool bosBull = is30m and not sweepArmed and bosWindowOk and not na(lastSwingHigh) and (close > lastSwingHigh)
+bool bosBear = is30m and not sweepArmed and bosWindowOk and not na(lastSwingLow)  and (close < lastSwingLow)
+
+if bosBull or bosBear
+    lastBosBar := bar_index
+
+if i_showChoch
+    if chochBull
+        line.new(lastSHBar, lastSwingHigh, bar_index, lastSwingHigh, color = i_chochColor, style = line.style_solid, width = 2)
+        label.new(bar_index, lastSwingHigh, text = "ChoCh", style = label.style_label_down, color = i_chochColor, textcolor = color.black, size = size.small)
+    if chochBear
+        line.new(lastSLBar, lastSwingLow, bar_index, lastSwingLow, color = i_chochColor, style = line.style_solid, width = 2)
+        label.new(bar_index, lastSwingLow, text = "ChoCh", style = label.style_label_up, color = i_chochColor, textcolor = color.black, size = size.small)
+
+if i_showBos
+    if bosBull
+        line.new(lastSHBar, lastSwingHigh, bar_index, lastSwingHigh, color = i_bosColor, style = line.style_solid, width = 1)
+        label.new(bar_index, lastSwingHigh, text = "BOS", style = label.style_label_down, color = i_bosColor, textcolor = color.black, size = size.tiny)
+    if bosBear
+        line.new(lastSLBar, lastSwingLow, bar_index, lastSwingLow, color = i_bosColor, style = line.style_solid, width = 1)
+        label.new(bar_index, lastSwingLow, text = "BOS", style = label.style_label_up, color = i_bosColor, textcolor = color.black, size = size.tiny)
+
+// ──────────────────────────────────────────────
+//  FAIR VALUE GAP
+// ──────────────────────────────────────────────
+var int chochBar = na
+if chochBull or chochBear
+    chochBar := bar_index
+
+bool fvgActive   = not na(chochBar) and (bar_index - chochBar <= 15)
+float minGapSize = close * (i_fvgMinSize / 100.0)
+
+bool bullFVG = is30m and fvgActive and (high[2] < low[0])  and ((low[0]  - high[2]) >= minGapSize)
+bool bearFVG = is30m and fvgActive and (low[2]  > high[0]) and ((low[2]  - high[0]) >= minGapSize)
+
+var box[]   fvgBoxes  = array.new_box()
+var float[] fvgTopArr = array.new_float()
+var float[] fvgBotArr = array.new_float()
+
+if i_showFVG
+    if bullFVG
+        array.push(fvgBoxes,  box.new(bar_index - 2, low[0],  bar_index + i_fvgExtend, high[2], border_color = i_fvgBorderC, bgcolor = i_fvgBullC))
+        array.push(fvgTopArr, low[0])
+        array.push(fvgBotArr, high[2])
+    if bearFVG
+        array.push(fvgBoxes,  box.new(bar_index - 2, low[2],  bar_index + i_fvgExtend, high[0], border_color = i_fvgBorderC, bgcolor = i_fvgBearC))
+        array.push(fvgTopArr, low[2])
+        array.push(fvgBotArr, high[0])
+
+var bool fvgTapped = false
+fvgTapped := false
+
+if array.size(fvgBoxes) > 0
+    int idx = array.size(fvgBoxes) - 1
+    while idx >= 0
+        float fTop = array.get(fvgTopArr, idx)
+        float fBot = array.get(fvgBotArr, idx)
+        box   b    = array.get(fvgBoxes,  idx)
+        bool  hit  = (close <= fTop and close >= fBot) or (low <= fTop and low >= fBot) or (high <= fTop and high >= fBot)
+        if hit
+            box.set_right(b, bar_index)
+            array.remove(fvgBoxes,  idx)
+            array.remove(fvgTopArr, idx)
+            array.remove(fvgBotArr, idx)
+            fvgTapped := true
+        else
+            box.set_right(b, bar_index + i_fvgExtend)
+        idx := idx - 1
+
+// ──────────────────────────────────────────────
+//  CONFLUENCE ENTRY SIGNALS
+//  LONG  = ChoCh Bull  +  Delta crosses up  (or FVG tap + delta bull)
+//  SHORT = ChoCh Bear  +  Delta crosses down (or FVG tap + delta bear)
+// ──────────────────────────────────────────────
+bool entryLong  = is30m and chochBull and (i_requireDelta ? deltaLong  or deltaBullish : true)
+bool entryShort = is30m and chochBear and (i_requireDelta ? deltaShort or deltaBearish : true)
+
+// FVG-tap re-entry (price pulls back into FVG after ChoCh)
+bool fvgEntryLong  = is30m and fvgTapped and deltaBullish
+bool fvgEntryShort = is30m and fvgTapped and deltaBearish
+
+if i_showEntry
+    if entryLong
+        label.new(bar_index, low, text = "BUY", style = label.style_label_up, color = i_entryBullC, textcolor = color.black, size = size.normal)
+    if entryShort
+        label.new(bar_index, high, text = "SELL", style = label.style_label_down, color = i_entrySellC, textcolor = color.white, size = size.normal)
+    if fvgEntryLong and not entryLong
+        label.new(bar_index, low, text = "RE-LONG", style = label.style_label_up, color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
+    if fvgEntryShort and not entryShort
+        label.new(bar_index, high, text = "RE-SHORT", style = label.style_label_down, color = color.new(color.maroon, 20), textcolor = color.white, size = size.small)
+
+// ──────────────────────────────────────────────
+//  ALERT CONDITIONS
+// ──────────────────────────────────────────────
+alertcondition(bullSweep,   title = "Sweep — Bullish",          message = "[30m] Bullish Liquidity Sweep. Watch for ChoCh + Delta cross.")
+alertcondition(bearSweep,   title = "Sweep — Bearish",          message = "[30m] Bearish Liquidity Sweep. Watch for ChoCh + Delta cross.")
+alertcondition(chochBull,   title = "ChoCh — Bullish",          message = "[30m] Bullish Change of Character confirmed.")
+alertcondition(chochBear,   title = "ChoCh — Bearish",          message = "[30m] Bearish Change of Character confirmed.")
+alertcondition(entryLong,   title = "ENTRY — Long Confluence",  message = "[30m] BUY: ChoCh + Delta confluence. Check FVG for entry.")
+alertcondition(entryShort,  title = "ENTRY — Short Confluence", message = "[30m] SELL: ChoCh + Delta confluence. Check FVG for entry.")
+alertcondition(fvgTapped,   title = "FVG Tap",                  message = "[30m] Price tapped unmitigated FVG — potential re-entry.")
+alertcondition(entryLong or entryShort or fvgEntryLong or fvgEntryShort, title = "Any Entry Signal", message = "[30m] LS-OFT·D entry signal fired.")
