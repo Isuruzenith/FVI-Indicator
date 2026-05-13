@@ -1,0 +1,355 @@
+//@version=5
+indicator("monitor", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=200)
+
+
+// ══════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════
+
+grp_daily     = "Daily HML Levels - 4H to 1M Only"
+show_daily    = input.bool(true, "Show Daily HML", group=grp_daily)
+daily_hi_col  = input.color(color.lime, "Daily High - Bright Green", group=grp_daily)
+daily_mid_col = input.color(color.yellow, "Daily Mid - Bright Yellow", group=grp_daily)
+daily_lo_col  = input.color(color.red, "Daily Low - Bright Red", group=grp_daily)
+
+grp_weekly     = "Weekly HML Levels - 1D Only"
+show_weekly    = input.bool(true, "Show Weekly HML", group=grp_weekly)
+weekly_hi_col  = input.color(color.lime, "Weekly High - Bright Green", group=grp_weekly)
+weekly_mid_col = input.color(color.yellow, "Weekly Mid - Bright Yellow", group=grp_weekly)
+weekly_lo_col  = input.color(color.red, "Weekly Low - Bright Red", group=grp_weekly)
+
+grp_level_style = "H/M/L Text + Line Position"
+txt_offset_bars = input.int(2, "H/M/L Text Offset From Last Candle", minval=1, maxval=20, group=grp_level_style)
+line_gap_bars   = input.int(3, "Space Between H/M/L and Line", minval=1, maxval=20, group=grp_level_style)
+line_len_bars   = input.int(120, "Line Length To Right", minval=20, maxval=450, group=grp_level_style)
+txt_width_bars  = input.int(1, "H/M/L Text Box Width", minval=1, maxval=10, group=grp_level_style)
+txt_atr_mult    = input.float(0.08, "H/M/L Text Box Height ATR", minval=0.01, maxval=1.0, step=0.01, group=grp_level_style)
+
+grp_liq      = "High Probability Liquidity Sweep"
+show_liq     = input.bool(true, "Highlight Sweep Candle Blue", group=grp_liq)
+liq_lookback = input.int(20, "Swing Lookback", minval=5, maxval=100, group=grp_liq)
+liq_col      = input.color(color.blue, "Sweep Candle Color", group=grp_liq)
+
+grp_fvg      = "Fair Value Gap - 5M Only"
+show_fvg     = input.bool(true, "Show FVG Boxes", group=grp_fvg)
+fvg_bull_col = input.color(color.new(color.teal, 75), "Bullish FVG", group=grp_fvg)
+fvg_bear_col = input.color(color.new(color.orange, 75), "Bearish FVG", group=grp_fvg)
+fvg_max      = input.int(10, "Max FVG Boxes", minval=1, maxval=50, group=grp_fvg)
+
+grp_vol      = "High Volume + Volume Delta - 5M Only"
+show_vol     = input.bool(true, "Highlight High Volume Candles", group=grp_vol)
+vol_mult     = input.float(1.5, "Volume Multiplier", minval=1.0, step=0.1, group=grp_vol)
+vol_lookback = input.int(20, "Volume Average Lookback", minval=5, group=grp_vol)
+vol_bull_col = input.color(color.new(color.lime, 60), "Bullish Delta Candle", group=grp_vol)
+vol_bear_col = input.color(color.new(color.maroon, 60), "Bearish Delta Candle", group=grp_vol)
+
+
+// ══════════════════════════════════════════════════════
+// TIMEFRAME DETECTION
+// ══════════════════════════════════════════════════════
+
+tf_minutes() =>
+    if timeframe.isseconds
+        timeframe.multiplier / 60.0
+    else if timeframe.isminutes
+        float(timeframe.multiplier)
+    else if timeframe.isdaily
+        float(timeframe.multiplier) * 1440.0
+    else if timeframe.isweekly
+        float(timeframe.multiplier) * 10080.0
+    else if timeframe.ismonthly
+        float(timeframe.multiplier) * 43200.0
+    else
+        na
+
+tfm = tf_minutes()
+
+is_1m_to_4h = timeframe.isminutes and not na(tfm) and tfm >= 1 and tfm <= 240
+is_1d       = timeframe.isdaily and timeframe.multiplier == 1
+is_5m       = timeframe.isminutes and timeframe.multiplier == 5
+
+daily_visible  = show_daily and is_1m_to_4h
+weekly_visible = show_weekly and is_1d
+fvg_visible    = show_fvg and is_5m
+vol_visible    = show_vol and is_5m
+
+
+// ══════════════════════════════════════════════════════
+// HTF DATA
+// Previous Daily + Previous Weekly H/M/L
+// ══════════════════════════════════════════════════════
+
+d_high = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+d_low  = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+d_mid  = (d_high + d_low) / 2.0
+
+w_high = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+w_low  = request.security(syminfo.tickerid, "W", low[1], lookahead=barmerge.lookahead_on)
+w_mid  = (w_high + w_low) / 2.0
+
+
+// ══════════════════════════════════════════════════════
+// LINE + H/M/L TEXT HELPERS
+// H/M/L uses transparent box text, not labels.
+// ══════════════════════════════════════════════════════
+
+update_line(line ln, float price, color col, int txt_offset, int gap_bars, int len_bars) =>
+    line result = ln
+
+    if not na(price)
+        int safe_len = math.max(1, math.min(len_bars, 500 - txt_offset - gap_bars))
+        int x1 = bar_index + txt_offset + gap_bars
+        int x2 = x1 + safe_len
+
+        if na(result)
+            result := line.new(
+                 x1,
+                 price,
+                 x2,
+                 price,
+                 xloc=xloc.bar_index,
+                 extend=extend.none,
+                 color=col,
+                 width=1
+             )
+        else
+            line.set_x1(result, x1)
+            line.set_x2(result, x2)
+            line.set_y1(result, price)
+            line.set_y2(result, price)
+            line.set_color(result, col)
+            line.set_width(result, 1)
+
+    result
+
+
+delete_line(line ln) =>
+    if not na(ln)
+        line.delete(ln)
+
+    line result = na
+    result
+
+
+update_text_box(box bx, float price, string txt, color col, int txt_offset, int width_bars, float y_pad) =>
+    box result = bx
+
+    if not na(price) and not na(y_pad) and y_pad > 0
+        int x_center = bar_index + txt_offset
+        int x_left   = x_center - width_bars
+        int x_right  = x_center + width_bars
+
+        if na(result)
+            result := box.new(
+                 left=x_left,
+                 top=price + y_pad,
+                 right=x_right,
+                 bottom=price - y_pad,
+                 xloc=xloc.bar_index,
+                 bgcolor=color.new(color.black, 100),
+                 border_color=color.new(color.black, 100),
+                 text=txt,
+                 text_color=col,
+                 text_size=size.small,
+                 text_halign=text.align_center,
+                 text_valign=text.align_center
+             )
+        else
+            box.set_lefttop(result, x_left, price + y_pad)
+            box.set_rightbottom(result, x_right, price - y_pad)
+            box.set_bgcolor(result, color.new(color.black, 100))
+            box.set_border_color(result, color.new(color.black, 100))
+            box.set_text(result, txt)
+            box.set_text_color(result, col)
+            box.set_text_size(result, size.small)
+            box.set_text_halign(result, text.align_center)
+            box.set_text_valign(result, text.align_center)
+
+    result
+
+
+delete_text_box(box bx) =>
+    if not na(bx)
+        box.delete(bx)
+
+    box result = na
+    result
+
+
+// ══════════════════════════════════════════════════════
+// DRAW DAILY + WEEKLY LEVELS
+// ══════════════════════════════════════════════════════
+
+atr_val = ta.atr(14)
+txt_pad = math.max(nz(atr_val, syminfo.mintick * 100) * txt_atr_mult, syminfo.mintick * 10)
+
+var line ln_d_hi  = na
+var line ln_d_mid = na
+var line ln_d_lo  = na
+
+var box txt_d_hi  = na
+var box txt_d_mid = na
+var box txt_d_lo  = na
+
+var line ln_w_hi  = na
+var line ln_w_mid = na
+var line ln_w_lo  = na
+
+var box txt_w_hi  = na
+var box txt_w_mid = na
+var box txt_w_lo  = na
+
+
+if daily_visible
+    ln_d_hi  := update_line(ln_d_hi, d_high, daily_hi_col, txt_offset_bars, line_gap_bars, line_len_bars)
+    ln_d_mid := update_line(ln_d_mid, d_mid, daily_mid_col, txt_offset_bars, line_gap_bars, line_len_bars)
+    ln_d_lo  := update_line(ln_d_lo, d_low, daily_lo_col, txt_offset_bars, line_gap_bars, line_len_bars)
+
+    txt_d_hi  := update_text_box(txt_d_hi, d_high, "H", daily_hi_col, txt_offset_bars, txt_width_bars, txt_pad)
+    txt_d_mid := update_text_box(txt_d_mid, d_mid, "M", daily_mid_col, txt_offset_bars, txt_width_bars, txt_pad)
+    txt_d_lo  := update_text_box(txt_d_lo, d_low, "L", daily_lo_col, txt_offset_bars, txt_width_bars, txt_pad)
+else
+    ln_d_hi  := delete_line(ln_d_hi)
+    ln_d_mid := delete_line(ln_d_mid)
+    ln_d_lo  := delete_line(ln_d_lo)
+
+    txt_d_hi  := delete_text_box(txt_d_hi)
+    txt_d_mid := delete_text_box(txt_d_mid)
+    txt_d_lo  := delete_text_box(txt_d_lo)
+
+
+if weekly_visible
+    ln_w_hi  := update_line(ln_w_hi, w_high, weekly_hi_col, txt_offset_bars, line_gap_bars, line_len_bars)
+    ln_w_mid := update_line(ln_w_mid, w_mid, weekly_mid_col, txt_offset_bars, line_gap_bars, line_len_bars)
+    ln_w_lo  := update_line(ln_w_lo, w_low, weekly_lo_col, txt_offset_bars, line_gap_bars, line_len_bars)
+
+    txt_w_hi  := update_text_box(txt_w_hi, w_high, "H", weekly_hi_col, txt_offset_bars, txt_width_bars, txt_pad)
+    txt_w_mid := update_text_box(txt_w_mid, w_mid, "M", weekly_mid_col, txt_offset_bars, txt_width_bars, txt_pad)
+    txt_w_lo  := update_text_box(txt_w_lo, w_low, "L", weekly_lo_col, txt_offset_bars, txt_width_bars, txt_pad)
+else
+    ln_w_hi  := delete_line(ln_w_hi)
+    ln_w_mid := delete_line(ln_w_mid)
+    ln_w_lo  := delete_line(ln_w_lo)
+
+    txt_w_hi  := delete_text_box(txt_w_hi)
+    txt_w_mid := delete_text_box(txt_w_mid)
+    txt_w_lo  := delete_text_box(txt_w_lo)
+
+
+// ══════════════════════════════════════════════════════
+// HIGH PROBABILITY LIQUIDITY SWEEP
+// ══════════════════════════════════════════════════════
+
+swing_high = ta.highest(high, liq_lookback)[1]
+swing_low  = ta.lowest(low, liq_lookback)[1]
+
+bull_sweep = show_liq and low < swing_low and close > swing_low and close > open
+bear_sweep = show_liq and high > swing_high and close < swing_high and close < open
+
+is_sweep = bull_sweep or bear_sweep
+
+
+// ══════════════════════════════════════════════════════
+// HIGH VOLUME + VOLUME DELTA - 5M ONLY
+// ══════════════════════════════════════════════════════
+
+vol_avg = ta.sma(volume, vol_lookback)
+is_hi_vol = vol_visible and volume > vol_avg * vol_mult
+
+hl_range = high - low
+buy_vol  = hl_range > 0 ? volume * (close - low) / hl_range : volume * 0.5
+sell_vol = hl_range > 0 ? volume * (high - close) / hl_range : volume * 0.5
+
+vol_delta = buy_vol - sell_vol
+is_bull_delta = vol_delta >= 0
+
+barcolor(
+     is_sweep ? liq_col :
+     is_hi_vol ? is_bull_delta ? vol_bull_col : vol_bear_col :
+     na
+ )
+
+
+// ══════════════════════════════════════════════════════
+// FVG BOXES - 5M ONLY
+// ══════════════════════════════════════════════════════
+
+var box[] fvg_boxes = array.new_box()
+var bool[] fvg_is_bull = array.new_bool()
+
+if fvg_visible and barstate.isconfirmed
+    bullish_fvg = high[2] < low
+    bearish_fvg = low[2] > high
+
+    if bullish_fvg
+        box bull_box = box.new(
+             bar_index - 2,
+             low,
+             bar_index,
+             high[2],
+             bgcolor=fvg_bull_col,
+             border_color=color.new(color.teal, 50),
+             extend=extend.right
+         )
+
+        array.push(fvg_boxes, bull_box)
+        array.push(fvg_is_bull, true)
+
+    if bearish_fvg
+        box bear_box = box.new(
+             bar_index - 2,
+             low[2],
+             bar_index,
+             high,
+             bgcolor=fvg_bear_col,
+             border_color=color.new(color.orange, 50),
+             extend=extend.right
+         )
+
+        array.push(fvg_boxes, bear_box)
+        array.push(fvg_is_bull, false)
+
+    while array.size(fvg_boxes) > fvg_max
+        box old_box = array.shift(fvg_boxes)
+        array.shift(fvg_is_bull)
+        box.delete(old_box)
+
+    int i = array.size(fvg_boxes) - 1
+
+    while i >= 0
+        box bx = array.get(fvg_boxes, i)
+        bool is_bull_fvg = array.get(fvg_is_bull, i)
+
+        fvg_filled = is_bull_fvg ? low <= box.get_bottom(bx) : high >= box.get_top(bx)
+
+        if fvg_filled
+            box.delete(bx)
+            array.remove(fvg_boxes, i)
+            array.remove(fvg_is_bull, i)
+
+        i -= 1
+
+
+if not fvg_visible and array.size(fvg_boxes) > 0
+    int j = array.size(fvg_boxes) - 1
+
+    while j >= 0
+        box bx = array.get(fvg_boxes, j)
+        box.delete(bx)
+        array.remove(fvg_boxes, j)
+        array.remove(fvg_is_bull, j)
+
+        j -= 1
+
+
+// ══════════════════════════════════════════════════════
+// INVISIBLE PLOTS
+// ══════════════════════════════════════════════════════
+
+plot(daily_visible ? d_high : na, "Daily High", display=display.none)
+plot(daily_visible ? d_mid : na, "Daily Mid", display=display.none)
+plot(daily_visible ? d_low : na, "Daily Low", display=display.none)
+
+plot(weekly_visible ? w_high : na, "Weekly High", display=display.none)
+plot(weekly_visible ? w_mid : na, "Weekly Mid", display=display.none)
+plot(weekly_visible ? w_low : na, "Weekly Low", display=display.none)
